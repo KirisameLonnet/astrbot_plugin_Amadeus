@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import shlex
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -17,6 +19,19 @@ from websockets.asyncio.server import ServerConnection, serve
 
 
 PLUGIN_NAME = "astrbot_plugin_phone_mcp"
+SAFE_ADB_SHELL_PATTERN = re.compile(r"^[A-Za-z0-9_./:=,@%+\-\s]+$")
+SAFE_ADB_SHELL_COMMANDS = {
+    "getprop",
+    "wm",
+    "settings",
+    "dumpsys",
+    "pm",
+    "cmd",
+    "am",
+    "input",
+    "logcat",
+    "screencap",
+}
 
 
 @dataclass
@@ -294,42 +309,60 @@ class Main(Star):
         return args
 
     async def _run_adb(self, args: list[str]) -> dict[str, Any]:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        return {
-            "command": args,
-            "returncode": proc.returncode,
-            "stdout": stdout.decode("utf-8", errors="ignore").strip(),
-            "stderr": stderr.decode("utf-8", errors="ignore").strip(),
-        }
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            return {
+                "command": args,
+                "returncode": proc.returncode,
+                "stdout": stdout.decode("utf-8", errors="ignore").strip(),
+                "stderr": stderr.decode("utf-8", errors="ignore").strip(),
+            }
+        except Exception as exc:
+            logger.error("phone_mcp adb exec failed: %s", exc)
+            return {
+                "command": args,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": str(exc),
+            }
 
     async def _capture_screencap(self, serial: str | None) -> dict[str, Any]:
         args = self._adb_base_args(serial) + ["exec-out", "screencap", "-p"]
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        result = {
-            "command": args,
-            "returncode": proc.returncode,
-            "stderr": stderr.decode("utf-8", errors="ignore").strip(),
-            "size_bytes": len(stdout),
-        }
-        if proc.returncode != 0 or not stdout:
-            return result
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            result = {
+                "command": args,
+                "returncode": proc.returncode,
+                "stderr": stderr.decode("utf-8", errors="ignore").strip(),
+                "size_bytes": len(stdout),
+            }
+            if proc.returncode != 0 or not stdout:
+                return result
 
-        if self._cfg_bool("persist_screenshots", True):
-            file_name = f"{int(time.time() * 1000)}_{uuid4().hex[:8]}.png"
-            file_path = self.screenshot_dir / file_name
-            file_path.write_bytes(stdout)
-            result["file_path"] = str(file_path)
-        return result
+            if self._cfg_bool("persist_screenshots", True):
+                file_name = f"{int(time.time() * 1000)}_{uuid4().hex[:8]}.png"
+                file_path = self.screenshot_dir / file_name
+                file_path.write_bytes(stdout)
+                result["file_path"] = str(file_path)
+            return result
+        except Exception as exc:
+            logger.error("phone_mcp screencap failed: %s", exc)
+            return {
+                "command": args,
+                "returncode": -1,
+                "stderr": str(exc),
+                "size_bytes": 0,
+            }
 
     async def _request_phone_frame(self, serial: str | None) -> dict[str, Any]:
         args = self._adb_base_args(serial) + [
@@ -342,6 +375,18 @@ class Main(Star):
             "com.astramadeus.client",
         ]
         return await self._run_adb(args)
+
+    def _parse_safe_shell_command(self, command: str) -> list[str] | None:
+        normalized = command.strip()
+        if not normalized or not SAFE_ADB_SHELL_PATTERN.fullmatch(normalized):
+            return None
+        try:
+            parts = shlex.split(normalized)
+        except ValueError:
+            return None
+        if not parts or parts[0] not in SAFE_ADB_SHELL_COMMANDS:
+            return None
+        return parts
 
     @filter.command("phone_status")
     async def phone_status(self, event: AstrMessageEvent):
@@ -564,7 +609,10 @@ class Main(Star):
         """
         if not self._cfg_bool("allow_adb_shell", False):
             return json.dumps({"error": "adb_shell_disabled"}, ensure_ascii=False)
+        safe_parts = self._parse_safe_shell_command(command)
+        if safe_parts is None:
+            return json.dumps({"error": "unsafe_adb_shell_command"}, ensure_ascii=False)
         result = await self._run_adb(
-            self._adb_base_args(serial) + ["shell", "sh", "-c", command]
+            self._adb_base_args(serial) + ["shell", *safe_parts]
         )
         return json.dumps(result, ensure_ascii=False)
