@@ -1,0 +1,37 @@
+{
+  "ws_host": {
+    "type": "string",
+    "description": "WebSocket bind host",
+    "default": "0.0.0.0"
+  },
+  "ws_port": {
+    "type": "int",
+    "description": "WebSocket bind port",
+    "default": 6910
+  },
+  "max_frames": {
+    "type": "int",
+    "description": "How many recent frames to keep in memory",
+    "default": 30
+  },
+  "persist_latest_frame": {
+    "type": "bool",
+    "description": "Persist latest frame to plugin data directory for debugging",
+    "default": true
+  },
+  "persist_screenshots": {
+    "type": "bool",
+    "description": "Persist adb screenshots to plugin data directory",
+    "default": true
+  },
+  "default_adb_serial": {
+    "type": "string",
+    "description": "Default adb serial. Leave empty to use adb default device selection.",
+    "default": ""
+  },
+  "allow_adb_shell": {
+    "type": "bool",
+    "description": "Allow arbitrary adb shell commands from tools",
+    "default": false
+  }
+}

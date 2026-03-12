@@ -1,0 +1,7 @@
+name: astrbot_plugin_phone_mcp
+display_name: Phone MCP Bridge
+description: Receive Android UI frames over WebSocket and expose phone/ADB tools to AstrBot agents.
+author: OpenCode
+version: 0.1.0
+repo: https://github.com/lonnet/AstrAmadeus
+astrbot_version: ">=4.16,<5"
