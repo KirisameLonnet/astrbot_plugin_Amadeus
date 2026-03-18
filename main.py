@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from websockets.asyncio.server import ServerConnection, serve
 
@@ -92,16 +92,9 @@ class FrameStore:
             return None
 
 
-@register(
-    PLUGIN_NAME,
-    "OpenCode",
-    "Phone websocket bridge with frame retrieval and ADB tools",
-    "0.1.0",
-)
 class Main(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
-        super().__init__(context)
-        self.context = context
+        super().__init__(context, config)
         self.config = config or AstrBotConfig()
         self.data_dir = Path(get_astrbot_plugin_data_path()) / PLUGIN_NAME
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -114,6 +107,8 @@ class Main(Star):
         self._server = None
         self._server_task: asyncio.Task[None] | None = None
         self._server_ready = asyncio.Event()
+
+    async def initialize(self) -> None:
         self._server_task = asyncio.create_task(self._run_ws_server())
 
     async def terminate(self) -> None:
@@ -397,11 +392,7 @@ class Main(Star):
 
     @llm_tool(name="phone_ws_status")
     async def phone_ws_status(self, event: AstrMessageEvent) -> str:
-        """Get websocket bridge status and latest frame metadata.
-
-        Args:
-            none(string): unused placeholder, pass empty string when needed.
-        """
+        """Get websocket bridge status and latest frame metadata."""
         return json.dumps(self._build_status(), ensure_ascii=False)
 
     @llm_tool(name="phone_get_latest_frame")
@@ -506,11 +497,7 @@ class Main(Star):
 
     @llm_tool(name="adb_list_devices")
     async def adb_list_devices(self, event: AstrMessageEvent) -> str:
-        """List connected adb devices.
-
-        Args:
-            none(string): unused placeholder, pass empty string when needed.
-        """
+        """List connected adb devices."""
         result = await self._run_adb(["adb", "devices"])
         return json.dumps(result, ensure_ascii=False)
 
