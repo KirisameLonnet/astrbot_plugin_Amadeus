@@ -7,17 +7,12 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve
 
 
 LOGGER = logging.getLogger("ws_frame_server")
-
-
-def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 def format_json(data: Any, compact: bool) -> str:

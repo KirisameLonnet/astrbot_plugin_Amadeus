@@ -32,6 +32,6 @@
   "allow_adb_shell": {
     "type": "bool",
     "description": "Allow arbitrary adb shell commands from tools",
-    "default": false
+    "default": true
   }
 }

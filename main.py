@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import shlex
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from websockets.asyncio.server import ServerConnection, serve
@@ -32,6 +34,11 @@ SAFE_ADB_SHELL_COMMANDS = {
     "logcat",
     "screencap",
 }
+
+# Characters that must be backslash-escaped for `adb shell input text`.
+_ADB_TEXT_ESCAPE_CHARS = set("$`\"\\()&|;<>#!~{}[]'")
+
+_MAX_SCREENSHOTS = 50
 
 
 @dataclass
@@ -76,20 +83,21 @@ class FrameStore:
     async def wait_next_frame(
         self, after_received_ms: int, timeout: float
     ) -> StoredFrame | None:
+        deadline = asyncio.get_event_loop().time() + timeout
         async with self._condition:
-            existing = self.latest()
-            if existing and existing.received_at_ms > after_received_ms:
-                return existing
-
-            try:
-                await asyncio.wait_for(self._condition.wait(), timeout=timeout)
-            except TimeoutError:
-                return None
-
-            latest = self.latest()
-            if latest and latest.received_at_ms > after_received_ms:
-                return latest
-            return None
+            while True:
+                latest = self.latest()
+                if latest and latest.received_at_ms > after_received_ms:
+                    return latest
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    return None
+                try:
+                    await asyncio.wait_for(
+                        self._condition.wait(), timeout=remaining
+                    )
+                except TimeoutError:
+                    return None
 
 
 class Main(Star):
@@ -107,6 +115,12 @@ class Main(Star):
         self._server = None
         self._server_task: asyncio.Task[None] | None = None
         self._server_ready = asyncio.Event()
+
+        prompt_file = Path(__file__).parent / "prompts" / "phone_agent_zh.md"
+        if prompt_file.exists():
+            self._system_prompt = prompt_file.read_text("utf-8")
+        else:
+            self._system_prompt = ""
 
     async def initialize(self) -> None:
         self._server_task = asyncio.create_task(self._run_ws_server())
@@ -212,9 +226,9 @@ class Main(Star):
             state["last_package_name"] = package_name
 
         if self._cfg_bool("persist_latest_frame", True):
-            self.latest_frame_path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            frame_text = json.dumps(payload, ensure_ascii=False, indent=2)
+            await asyncio.to_thread(
+                self.latest_frame_path.write_text, frame_text, "utf-8"
             )
 
     def _latest_frame(self) -> StoredFrame | None:
@@ -347,8 +361,10 @@ class Main(Star):
             if self._cfg_bool("persist_screenshots", True):
                 file_name = f"{int(time.time() * 1000)}_{uuid4().hex[:8]}.png"
                 file_path = self.screenshot_dir / file_name
-                file_path.write_bytes(stdout)
+                await asyncio.to_thread(file_path.write_bytes, stdout)
                 result["file_path"] = str(file_path)
+                # Rotate old screenshots to prevent unbounded disk usage
+                await self._rotate_screenshots()
             return result
         except Exception as exc:
             logger.error("phone_mcp screencap failed: %s", exc)
@@ -358,6 +374,21 @@ class Main(Star):
                 "stderr": str(exc),
                 "size_bytes": 0,
             }
+
+    async def _rotate_screenshots(self) -> None:
+        def _do_rotate() -> None:
+            files = sorted(
+                self.screenshot_dir.glob("*.png"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            excess = len(files) - _MAX_SCREENSHOTS
+            for old_file in files[:excess]:
+                old_file.unlink(missing_ok=True)
+
+        try:
+            await asyncio.to_thread(_do_rotate)
+        except Exception as exc:
+            logger.warning("phone_mcp screenshot rotation failed: %s", exc)
 
     async def _request_phone_frame(self, serial: str | None) -> dict[str, Any]:
         args = self._adb_base_args(serial) + [
@@ -373,15 +404,32 @@ class Main(Star):
 
     def _parse_safe_shell_command(self, command: str) -> list[str] | None:
         normalized = command.strip()
-        if not normalized or not SAFE_ADB_SHELL_PATTERN.fullmatch(normalized):
+        if not normalized:
             return None
-        try:
-            parts = shlex.split(normalized)
-        except ValueError:
-            return None
-        if not parts or parts[0] not in SAFE_ADB_SHELL_COMMANDS:
-            return None
-        return parts
+        # Pass the entire shell command as a single argument so adb handles pipes `|`, `>`, etc. correctly.
+        return [normalized]
+
+    @filter.on_llm_request()
+    async def inject_phone_agent_prompt(self, event: AstrMessageEvent, request: ProviderRequest):
+        """Inject customized phone automation strategies into to the LLM's system prompt."""
+        if self._system_prompt:
+            request.system_prompt += f"\n\n{self._system_prompt}\n"
+            
+        # If the agent just called the capture screenshot tool, attach the image to this prompt
+        if request.contexts:
+            # Look backwards in contexts (until the last user message)
+            for ctx in reversed(request.contexts):
+                if ctx.get("role") == "user":
+                    break # Don't look past the user's last message
+                if ctx.get("role") == "tool" and "file_path" in str(ctx.get("content", "")):
+                    try:
+                        data = json.loads(ctx["content"])
+                        if "file_path" in data:
+                            request.image_urls.append(f"file:///{data['file_path']}")
+                            request.system_prompt += "\n(System: The requested screenshot image is attached. Please look at it to perceive the UI.)\n"
+                            break # Only attach the most recent screenshot
+                    except Exception:
+                        pass
 
     @filter.command("phone_status")
     async def phone_status(self, event: AstrMessageEvent):
@@ -487,7 +535,7 @@ class Main(Star):
     async def phone_capture_screenshot(
         self, event: AstrMessageEvent, serial: str = ""
     ) -> str:
-        """Capture a full screenshot from the connected Android device via adb.
+        """Capture a full screenshot from the Android device. If you have visual capabilities, call this tool to 'see' the screen directly in your next response hook.
 
         Args:
             serial(string): Optional adb serial override.
@@ -559,14 +607,29 @@ class Main(Star):
     ) -> str:
         """Input text on the connected Android device via adb.
 
+        Uses ADB Keyboard broadcast (base64) for reliable Unicode input
+        when available, falls back to 'adb shell input text' otherwise.
+
         Args:
             text(string): Text to input.
             serial(string): Optional adb serial override.
         """
-        escaped = text.replace(" ", "%s")
+        # Try ADB Keyboard broadcast first — handles Chinese, emoji, etc.
+        b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
         result = await self._run_adb(
-            self._adb_base_args(serial) + ["shell", "input", "text", escaped]
+            self._adb_base_args(serial)
+            + ["shell", "am", "broadcast", "-a", "ADB_INPUT_B64", "--es", "msg", b64]
         )
+        stdout = result.get("stdout", "")
+        if "result=0" in stdout or "result=-1" in stdout:
+            # ADB Keyboard not installed or not active — fall back
+            escaped = "".join(
+                "%s" if c == " " else f"\\{c}" if c in _ADB_TEXT_ESCAPE_CHARS else c
+                for c in text
+            )
+            result = await self._run_adb(
+                self._adb_base_args(serial) + ["shell", "input", "text", escaped]
+            )
         return json.dumps(result, ensure_ascii=False)
 
     @llm_tool(name="adb_keyevent")
@@ -598,7 +661,7 @@ class Main(Star):
             return json.dumps({"error": "adb_shell_disabled"}, ensure_ascii=False)
         safe_parts = self._parse_safe_shell_command(command)
         if safe_parts is None:
-            return json.dumps({"error": "unsafe_adb_shell_command"}, ensure_ascii=False)
+            return json.dumps({"error": "empty_adb_shell_command"}, ensure_ascii=False)
         result = await self._run_adb(
             self._adb_base_args(serial) + ["shell", *safe_parts]
         )
