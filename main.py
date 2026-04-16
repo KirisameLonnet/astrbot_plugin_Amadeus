@@ -310,6 +310,111 @@ class Main(Star):
                 break
         return matches
 
+    def _search_nodes_scored(
+        self, query: str, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        """Search nodes with multi-tier scoring for hybrid vision tap/locate.
+
+        Scoring tiers:
+        - Exact text/desc match: +20
+        - Substring in text/desc: +10
+        - Match in resource_id: +6
+        - Match in semantic_hint: +6
+        - Match in class_name: +3
+        - Clickable bonus: +5
+        - Visible bonus: +3
+        - Shallow depth bonus: +2 * (1 / (depth+1))
+        - Smaller area preferred (more precise target): +1 if area < median
+        """
+        latest = self._latest_frame()
+        if latest is None:
+            return []
+        ui_state = latest.ui_state
+        data = ui_state.get("data", {}) if isinstance(ui_state, dict) else {}
+        elements = data.get("elements", []) if isinstance(data, dict) else []
+        if not isinstance(elements, list) or not elements:
+            return []
+
+        lowered = query.strip().lower()
+        if not lowered:
+            return []
+
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+
+            text = str(element.get("text", "")).lower()
+            desc = str(element.get("desc", "")).lower()
+            resource_id = str(element.get("resource_id", "")).lower()
+            semantic_hint = str(element.get("semantic_hint", "")).lower()
+            class_name = str(element.get("class_name", "")).lower()
+
+            score = 0.0
+
+            # Tier 1: exact match on text or desc
+            if text == lowered or desc == lowered:
+                score += 20.0
+            # Tier 2: substring match on text or desc
+            elif lowered in text or lowered in desc:
+                score += 10.0
+            # Tier 3: match in resource_id or semantic_hint
+            elif lowered in resource_id or lowered in semantic_hint:
+                score += 6.0
+            # Tier 4: match in class_name
+            elif lowered in class_name:
+                score += 3.0
+            else:
+                continue  # No match at all
+
+            # Bonuses
+            is_clickable = element.get("is_clickable", False)
+            if is_clickable:
+                score += 5.0
+            if element.get("is_visible_to_user", True):
+                score += 3.0
+            depth = element.get("depth", 0)
+            if isinstance(depth, (int, float)) and depth >= 0:
+                score += 2.0 / (depth + 1)
+
+            # Prefer nodes with tap_point already computed
+            if element.get("tap_point"):
+                score += 1.0
+
+            result = dict(element)
+            result["_match_score"] = round(score, 2)
+            scored.append((score, result))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [item for _, item in scored[:limit]]
+
+    def _get_current_package(self) -> str:
+        """Get the package name from the latest frame."""
+        latest = self._latest_frame()
+        if latest is None:
+            return ""
+        ui_state = latest.ui_state
+        data = ui_state.get("data", {}) if isinstance(ui_state, dict) else {}
+        return data.get("package_name", "")
+
+    def _extract_tap_point(self, element: dict[str, Any]) -> tuple[int, int] | None:
+        """Extract tap coordinates from an element, computing from bounds if needed."""
+        tap_point = element.get("tap_point")
+        if isinstance(tap_point, list) and len(tap_point) == 2:
+            return int(tap_point[0]), int(tap_point[1])
+
+        # Fallback: compute from bounds string "[left,top][right,bottom]"
+        bounds_str = str(element.get("bounds", ""))
+        parts = bounds_str.replace("[", "").replace("]", ",").split(",")
+        nums = [p.strip() for p in parts if p.strip()]
+        if len(nums) >= 4:
+            try:
+                left, top, right, bottom = int(nums[0]), int(nums[1]), int(nums[2]), int(nums[3])
+                return (left + right) // 2, (top + bottom) // 2
+            except (ValueError, IndexError):
+                pass
+        return None
+
     def _adb_base_args(self, serial: str | None) -> list[str]:
         args = ["adb"]
         chosen_serial = (serial or self._cfg_str("default_adb_serial", "")).strip()
@@ -445,18 +550,27 @@ class Main(Star):
 
     @llm_tool(name="phone_get_latest_frame")
     async def phone_get_latest_frame(
-        self, event: AstrMessageEvent, summary_only: bool = False
+        self, event: AstrMessageEvent, summary_only: bool = False, vision_mode: bool = False
     ) -> str:
         """Read the latest phone UI frame as structured data.
 
+        For vision-assisted apps, consider using phone_vision_describe instead —
+        it attaches a screenshot for visual understanding and returns a compact summary
+        without the full element tree.
+
         Args:
             summary_only(boolean): When true, return frame summary instead of full JSON.
+            vision_mode(boolean): When true, return compact summary without elements array (UI tree kept locally for coordinate lookup via phone_vision_tap).
         """
         latest = self._latest_frame()
         if latest is None:
             return json.dumps({"error": "no_frame"}, ensure_ascii=False)
-        payload: Any = self._frame_summary(latest) if summary_only else latest.payload
-        return json.dumps(payload, ensure_ascii=False)
+        if vision_mode or summary_only:
+            payload: Any = self._frame_summary(latest)
+            if vision_mode:
+                payload["hint"] = "UI tree kept locally. Use phone_vision_tap(query) to tap elements by text, or phone_capture_screenshot to see the screen."
+            return json.dumps(payload, ensure_ascii=False)
+        return json.dumps(latest.payload, ensure_ascii=False)
 
     @llm_tool(name="phone_get_recent_frames")
     async def phone_get_recent_frames(
@@ -529,6 +643,164 @@ class Main(Star):
         """
         return json.dumps(
             self._search_nodes(query, max(1, min(limit, 20))), ensure_ascii=False
+        )
+
+    @llm_tool(name="phone_vision_tap")
+    async def phone_vision_tap(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        serial: str = "",
+    ) -> str:
+        """Hybrid vision action: search the local UI tree for an element matching
+        the query text, then tap it. Use this after visually understanding the
+        screen via a screenshot.
+
+        The query is matched against element text, description, resource ID, and
+        semantic hints using multi-tier scoring. The best matching clickable
+        element is tapped automatically.
+
+        Args:
+            query(string): Target element text, label, or description (e.g. "美团外卖", "搜索", "购物车").
+            serial(string): Optional adb serial override.
+        """
+        matches = self._search_nodes_scored(query, limit=5)
+        if not matches:
+            return json.dumps(
+                {
+                    "result": "no_match",
+                    "query": query,
+                    "hint": "No element found matching the query. Try phone_find_nodes with a broader keyword, or use adb_tap with estimated coordinates.",
+                },
+                ensure_ascii=False,
+            )
+
+        # Pick the best match
+        best = matches[0]
+        tap = self._extract_tap_point(best)
+        if tap is None:
+            return json.dumps(
+                {
+                    "result": "no_coordinates",
+                    "query": query,
+                    "matched_text": best.get("text", ""),
+                    "matched_id": best.get("id", ""),
+                    "hint": "Found a matching element but could not extract tap coordinates. Use adb_tap with estimated coordinates.",
+                },
+                ensure_ascii=False,
+            )
+
+        x, y = tap
+        tap_result = await self._run_adb(
+            self._adb_base_args(serial) + ["shell", "input", "tap", str(x), str(y)]
+        )
+
+        return json.dumps(
+            {
+                "result": "tapped",
+                "query": query,
+                "matched_text": best.get("text", ""),
+                "matched_id": best.get("id", ""),
+                "match_score": best.get("_match_score", 0),
+                "tap_point": [x, y],
+                "adb": tap_result,
+                "alternatives": [
+                    {
+                        "text": m.get("text", ""),
+                        "id": m.get("id", ""),
+                        "score": m.get("_match_score", 0),
+                        "tap_point": self._extract_tap_point(m),
+                    }
+                    for m in matches[1:3]
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    @llm_tool(name="phone_vision_locate")
+    async def phone_vision_locate(
+        self, event: AstrMessageEvent, query: str, limit: int = 5
+    ) -> str:
+        """Search the local UI tree for elements matching the query and return
+        their coordinates without tapping. Use this to verify element positions
+        before acting.
+
+        Args:
+            query(string): Target element text, label, or description.
+            limit(number): Max number of candidates to return.
+        """
+        matches = self._search_nodes_scored(query, limit=max(1, min(limit, 10)))
+        if not matches:
+            return json.dumps(
+                {"result": "no_match", "query": query, "candidates": []},
+                ensure_ascii=False,
+            )
+
+        candidates = []
+        for m in matches:
+            tap = self._extract_tap_point(m)
+            candidates.append(
+                {
+                    "text": m.get("text", ""),
+                    "id": m.get("id", ""),
+                    "bounds": m.get("bounds", ""),
+                    "tap_point": list(tap) if tap else None,
+                    "match_score": m.get("_match_score", 0),
+                    "is_clickable": m.get("is_clickable", False),
+                    "semantic_hint": m.get("semantic_hint", ""),
+                }
+            )
+
+        return json.dumps(
+            {"result": "found", "query": query, "candidates": candidates},
+            ensure_ascii=False,
+        )
+
+    @llm_tool(name="phone_vision_describe")
+    async def phone_vision_describe(
+        self, event: AstrMessageEvent, serial: str = ""
+    ) -> str:
+        """Hybrid vision perception: capture a screenshot (auto-attached to your
+        visual context) and return a compact frame summary. Use this as your
+        primary "eyes" for vision-assisted apps instead of reading the full UI tree.
+
+        After calling this, look at the attached screenshot to understand the screen,
+        then use phone_vision_tap(query) to act on what you see.
+
+        Args:
+            serial(string): Optional adb serial override.
+        """
+        # Capture screenshot (will be auto-attached by inject_phone_agent_prompt)
+        screenshot_result = await self._capture_screencap(serial)
+
+        # Build compact summary from latest frame
+        latest = self._latest_frame()
+        summary: dict[str, Any] = {}
+        if latest is not None:
+            frame_summary = self._frame_summary(latest)
+            summary = {
+                "package_name": frame_summary.get("package_name", ""),
+                "activity_name": frame_summary.get("activity_name", ""),
+                "element_count": frame_summary.get("element_count", 0),
+                "actionable_count": frame_summary.get("actionable_count", 0),
+                "text_count": frame_summary.get("text_count", 0),
+            }
+            # Check for overlay
+            ui_state = latest.ui_state
+            data = ui_state.get("data", {}) if isinstance(ui_state, dict) else {}
+            if data.get("overlay_detected"):
+                summary["overlay_detected"] = True
+                summary["overlay_close_node_id"] = data.get("overlay_close_node_id", "")
+        else:
+            summary = {"warning": "no_frame_available"}
+
+        return json.dumps(
+            {
+                "screenshot": screenshot_result,
+                "frame_summary": summary,
+                "hint": "Screenshot attached. Look at the image to understand the screen. Use phone_vision_tap(query) to tap elements by their visible text or description.",
+            },
+            ensure_ascii=False,
         )
 
     @llm_tool(name="phone_capture_screenshot")
