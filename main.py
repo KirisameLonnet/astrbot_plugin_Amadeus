@@ -522,16 +522,15 @@ class Main(Star):
             
         # If the agent just called the capture screenshot tool, attach the image to this prompt
         if request.contexts:
-            # Look backwards in contexts (until the last user message)
+            # Look backwards in contexts to find the most recent screenshot
             for ctx in reversed(request.contexts):
-                if ctx.get("role") == "user":
-                    break # Don't look past the user's last message
                 if ctx.get("role") == "tool" and "file_path" in str(ctx.get("content", "")):
                     try:
                         data = json.loads(ctx["content"])
                         if "file_path" in data:
+                            # Attach the image to the current provider request
                             request.image_urls.append(f"file:///{data['file_path']}")
-                            request.system_prompt += "\n(System: The requested screenshot image is attached. Please look at it to perceive the UI.)\n"
+                            request.system_prompt += "\n\n[SYSTEM NOTIFICATION]\nThe requested screenshot image is attached to this turn. Please look at it to perceive the UI and continue your task.\n"
                             break # Only attach the most recent screenshot
                     except Exception:
                         pass
