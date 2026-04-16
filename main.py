@@ -313,7 +313,7 @@ class Main(Star):
     def _search_nodes_scored(
         self, query: str, limit: int = 10
     ) -> list[dict[str, Any]]:
-        """Search nodes with multi-tier scoring for hybrid vision tap/locate.
+        """Search nodes with multi-tier scoring for VL model tap/locate.
 
         Scoring tiers:
         - Exact text/desc match: +20
@@ -652,7 +652,7 @@ class Main(Star):
         query: str,
         serial: str = "",
     ) -> str:
-        """Hybrid vision action: search the local UI tree for an element matching
+        """VL model action: search the local UI tree for an element matching
         the query text, then tap it. Use this after visually understanding the
         screen via a screenshot.
 
@@ -760,7 +760,7 @@ class Main(Star):
     async def phone_vision_describe(
         self, event: AstrMessageEvent, serial: str = ""
     ) -> str:
-        """Hybrid vision perception: capture a screenshot (auto-attached to your
+        """VL model perception: capture a screenshot (auto-attached to your
         visual context) and return a compact frame summary. Use this as your
         primary "eyes" for vision-assisted apps instead of reading the full UI tree.
 
