@@ -744,6 +744,35 @@ class Main(Star):
             return
 
         logger.info("phone_mcp ACT Parser intercepted: %s -> %s %s", action, tool_name, tool_args)
+        
+        # Hack: Since ToolLoopAgentRunner has already set its state to DONE by the time on_llm_response
+        # is fired (because there were no native JSON tool calls), it will break the run loop after this.
+        # We must manually walk the call stack, find the runner, and reset its state so the loop continues.
+        import inspect
+        try:
+            for frame_info in inspect.stack():
+                l_vars = frame_info.frame.f_locals
+                if "self" in l_vars and l_vars["self"].__class__.__name__ == "ToolLoopAgentRunner":
+                    runner = l_vars["self"]
+                    # AgentState is imported in the runner's module, not a class attr.
+                    runner_module = type(runner).__module__
+                    import sys
+                    mod = sys.modules.get(runner_module)
+                    if mod and hasattr(mod, "AgentState"):
+                        runner._state = mod.AgentState.RUNNING
+                        # Also remove the text-only assistant message that step() already appended
+                        # at L507 (before our hook), to prevent duplicate context entries.
+                        # The tool-handling block at L580 will re-add a proper assistant message
+                        # that includes both text and tool_calls.
+                        if runner.run_context.messages and hasattr(runner.run_context.messages[-1], 'role'):
+                            last_msg = runner.run_context.messages[-1]
+                            if getattr(last_msg, 'role', None) == 'assistant':
+                                runner.run_context.messages.pop()
+                        logger.info("phone_mcp reset ToolLoopAgentRunner._state to RUNNING")
+                    break
+        except Exception as e:
+            logger.warning("phone_mcp state reset hack failed: %s", e)
+
         resp.tools_call_name.append(tool_name)
         resp.tools_call_args.append(tool_args)
         resp.tools_call_ids.append(f"call_ast_{uuid4().hex[:8]}")
