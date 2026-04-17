@@ -19,6 +19,7 @@ from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from websockets.asyncio.server import ServerConnection, serve
+from .trajectory_logger import TrajectoryLogger
 
 
 PLUGIN_NAME = "astrbot_plugin_phone_mcp"
@@ -110,6 +111,9 @@ class Main(Star):
         self.latest_frame_path = self.data_dir / "latest_frame.json"
         self.screenshot_dir = self.data_dir / "screenshots"
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+        self._trajectory_logger = TrajectoryLogger(str(self.data_dir / "trajectories.db"))
+        self._rl_sessions: dict[str, dict[str, Any]] = {}
 
         self.frame_store = FrameStore(self._cfg_int("max_frames", 30))
         self.connections: dict[str, dict[str, Any]] = {}
@@ -518,6 +522,16 @@ class Main(Star):
     @filter.on_llm_request()
     async def inject_phone_agent_prompt(self, event: AstrMessageEvent, request: ProviderRequest):
         """Inject customized phone automation strategies into to the LLM's system prompt."""
+        session_id = event.session_id
+        if session_id not in self._rl_sessions:
+            instruction = str(event.message_obj.message_str)
+            self._rl_sessions[session_id] = {
+                "instruction": instruction,
+                "step_index": 0,
+                "last_screenshot": ""
+            }
+            self._trajectory_logger.start_episode(session_id, instruction)
+
         if self._system_prompt:
             request.system_prompt += f"\n\n{self._system_prompt}\n"
             
@@ -531,6 +545,8 @@ class Main(Star):
                         if "file_path" in data:
                             # Attach the image to the current provider request
                             request.image_urls.append(f"file:///{data['file_path']}")
+                            if session_id in self._rl_sessions:
+                                self._rl_sessions[session_id]["last_screenshot"] = data["file_path"]
                             request.system_prompt += "\n\n[SYSTEM NOTIFICATION]\nThe requested screenshot image is attached to this turn. Please look at it to perceive the UI and continue your task.\n"
                             break # Only attach the most recent screenshot
                     except Exception:
@@ -571,6 +587,23 @@ class Main(Star):
             logger.warning("phone_mcp intercepted action missing 'action' inside do().")
             return
             
+        session_id = event.session_id
+        session_ctx = self._rl_sessions.get(session_id, {})
+        step_index = session_ctx.get("step_index", 0)
+        screenshot_path = session_ctx.get("last_screenshot", "")
+        
+        think_content = ""
+        think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL | re.IGNORECASE)
+        if think_match:
+            think_content = think_match.group(1).strip()
+            
+        action_content_raw = f"do({cmd_str})"
+        
+        # Log this step
+        if session_id in self._rl_sessions:
+            self._trajectory_logger.log_step(session_id, step_index, screenshot_path, think_content, action_content_raw)
+            self._rl_sessions[session_id]["step_index"] += 1
+            
         tool_name = ""
         tool_args = {}
 
@@ -606,7 +639,13 @@ class Main(Star):
         elif action == "Wait":
             tool_name = "phone_wait_next_frame"
         elif action == "Finish":
-            return 
+            status = kwargs.get("status", "unknown")
+            reason = kwargs.get("reason", "")
+            reward = 1 if str(status).lower() == "success" else 0
+            self._trajectory_logger.commit_episode(session_id, str(status), str(reason), reward=reward)
+            if session_id in self._rl_sessions:
+                del self._rl_sessions[session_id]
+            return
         else:
             logger.warning("phone_mcp intercepted unknown action: %s", action)
             return
@@ -744,13 +783,26 @@ class Main(Star):
             query(string): Target element text, label, or description (e.g. "美团外卖", "搜索", "购物车").
             serial(string): Optional adb serial override.
         """
-        matches = self._search_nodes_scored(query, limit=5)
+        max_scrolls = 3
+        for i in range(max_scrolls):
+            matches = self._search_nodes_scored(query, limit=5)
+            if matches:
+                break
+            
+            if i < max_scrolls - 1:
+                # Auto-swipe: swipe from bottom to top (scroll down)
+                await self._run_adb(
+                    self._adb_base_args(serial) + ["shell", "input", "swipe", "500", "1500", "500", "500"]
+                )
+                # Wait for animation and new UI frame from websocket
+                await asyncio.sleep(2.0)
+
         if not matches:
             return json.dumps(
                 {
                     "result": "no_match",
                     "query": query,
-                    "hint": "No element found matching the query. Try phone_find_nodes with a broader keyword, or use adb_tap with estimated coordinates.",
+                    "hint": "No element found matching the query. Try FindNodes with a broader keyword, or use Tap with estimated coordinates.",
                 },
                 ensure_ascii=False,
             )
@@ -765,7 +817,7 @@ class Main(Star):
                     "query": query,
                     "matched_text": best.get("text", ""),
                     "matched_id": best.get("id", ""),
-                    "hint": "Found a matching element but could not extract tap coordinates. Use adb_tap with estimated coordinates.",
+                    "hint": "Found a matching element but could not extract tap coordinates. Use Tap with estimated coordinates.",
                 },
                 ensure_ascii=False,
             )
@@ -809,10 +861,26 @@ class Main(Star):
             query(string): Target element text, label, or description.
             limit(number): Max number of candidates to return.
         """
-        matches = self._search_nodes_scored(query, limit=max(1, min(limit, 10)))
+        max_scrolls = 3
+        for i in range(max_scrolls):
+            matches = self._search_nodes_scored(query, limit=max(1, min(limit, 10)))
+            if matches:
+                break
+                
+            if i < max_scrolls - 1:
+                # Auto-swipe: swipe from bottom to top (scroll down)
+                await self._run_adb(
+                    self._adb_base_args("") + ["shell", "input", "swipe", "500", "1500", "500", "500"]
+                )
+                await asyncio.sleep(2.0)
+
         if not matches:
-            return json.dumps(
-                {"result": "no_match", "query": query, "candidates": []},
+            return json.dumps({
+                    "result": "no_match", 
+                    "query": query, 
+                    "candidates": [],
+                    "hint": "No element found matching the query. Use Tap with estimated coordinates.",
+                },
                 ensure_ascii=False,
             )
 

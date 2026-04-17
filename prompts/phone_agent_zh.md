@@ -26,13 +26,13 @@
 | **Swipe** | `<answer>do(action="Swipe", from_pt=[500, 2000], to_pt=[500, 500])</answer>`<br>滑动屏幕，从起点坐标到终点坐标。 |
 | **Input** | `<answer>do(action="Input", text="买奶茶")</answer>`<br>在当前**已激活焦点**的输入框中键入文本内容（注意：需先 Tap 让光标出现）。 |
 | **Key** | `<answer>do(action="Key", code="4")</answer>`<br>模拟系统按键，例如 "4" 是全局返回，"3" 是回到桌面。 |
-| **VisionTap** | `<answer>do(action="VisionTap", query="美团外卖")</answer>`<br>让本地引擎模糊搜索含有"美团外卖"字样的模块并自动点击（非常推荐作为文本寻找的首选）。 |
+| **VisionTap** | `<answer>do(action="VisionTap", query="美团外卖")</answer>`<br>让本地引擎模糊搜索含有"美团外卖"字样的模块并自动点击。**此命令自带自动向下滑屏搜寻的功能**，如返回 `no_match` 说明翻到底也没找到，建议换搜索词或确认当前页面。 |
 | **VisionLocate**| `<answer>do(action="VisionLocate", query="购物车")</answer>`<br>查询目标文字或描述的位置并作为后续判断依据，不执行点击。 |
 | **FindNodes** | `<answer>do(action="FindNodes", query="搜索")</answer>`<br>单纯查询 UI 树节点作为参考资料。 |
 | **Perceive** | `<answer>do(action="Perceive")</answer>`<br>让系统给你截个图并且提取最新屏幕包名摘要，这会在下轮对话作为视觉附件传给你！建议每当不确定页面有啥时都先 Perceive 分辨一下。 |
 | **AppLaunch** | `<answer>do(action="AppLaunch", command="monkey -p com.sankuai.meituan -c android.intent.category.LAUNCHER 1")</answer>`<br>使用 adb shell 运行命令启动 APP 或做其他系统配置。 |
 | **Wait** | `<answer>do(action="Wait")</answer>`<br>等待数秒，通常用于页面加载中。 |
-| **Finish** | `<answer>do(action="Finish")</answer>`<br>你认为最终任务已经完成，或者无计可施必须请求人类协助时使用。结束本次流程。 |
+| **Finish** | `<answer>do(action="Finish", status="success", reason="...")</answer>`<br>你认为最终任务已经完成并进行严格自我判定时使用（`status`必须为`success`或`fail`，`reason`解释原因）。无计可施或任务失败请返回 fail。 |
 
 ---
 
@@ -66,7 +66,7 @@ do(action="VisionTap", query="搜索")
 </answer>
 ```
 
-### 例证 3：遇到牛皮癣小弹窗
+### 例证 4：遇到牛皮癣小弹窗
 **Agent**:
 ```xml
 <think>
