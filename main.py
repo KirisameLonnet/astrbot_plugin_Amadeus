@@ -579,6 +579,15 @@ class Main(Star):
         if self._system_prompt:
             request.system_prompt += f"\n\n{self._system_prompt}\n"
 
+        # Hide phone and adb tools from the native LLM function tool set.
+        # This prevents the model from throwing JSON tools over the wall via OpenAI format, 
+        # forcing it to use our more robust text-based `do(action="...", ...)` parsing.
+        if getattr(request, "func_tool", None) and getattr(request.func_tool, "tools", None):
+            request.func_tool.tools = [
+                t for t in request.func_tool.tools 
+                if not (getattr(t, "name", "") or "").startswith("phone_") and not (getattr(t, "name", "") or "").startswith("adb_")
+            ]
+
         # Always inject lightweight frame metadata so the model has ground truth
         # about what app is currently in foreground (prevents hallucination).
         latest = self._latest_frame()
@@ -657,28 +666,29 @@ class Main(Star):
         if not text:
             return
 
-        # Make <answer> optional and use non-greedy match for do(...)
-        match = re.search(r"do\((.*?)\)", text, re.DOTALL | re.IGNORECASE)
-        if not match:
+        # Make <answer> optional and use finditer for multiple do(...) calls
+        matches = list(re.finditer(r"do\((.*?)\)", text, re.DOTALL | re.IGNORECASE))
+        if not matches:
             # Debug: log when model output contains no do() command at all
             preview = text[:200].replace('\n', ' ')
             logger.warning("phone_mcp no do() command found in model output: %s...", preview)
             return
 
-        cmd_str = match.group(1).strip()
-        # Replace full-width quotes that models often hallucinate
-        cmd_str = cmd_str.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
-        
-        kwargs = self._parse_do_command(cmd_str)
-        action = kwargs.pop("action", None)
-        if not action:
-            logger.warning("phone_mcp intercepted action missing 'action' inside do().")
-            return
+        for match in matches:
+            cmd_str = match.group(1).strip()
+            # Replace full-width quotes that models often hallucinate
+            cmd_str = cmd_str.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
             
-        tool_name = ""
-        tool_args = {}
+            kwargs = self._parse_do_command(cmd_str)
+            action = kwargs.pop("action", None)
+            if not action:
+                logger.warning("phone_mcp intercepted action missing 'action' inside do().")
+                continue
+                
+            tool_name = ""
+            tool_args = {}
 
-        if action == "Tap":
+            if action == "Tap":
             tool_name = "adb_tap"
             pt = kwargs.get("element", [0, 0])
             tool_args = {"x": pt[0], "y": pt[1]}
@@ -696,6 +706,10 @@ class Main(Star):
         elif action == "VisionTap":
             tool_name = "phone_vision_tap"
             tool_args = {"query": str(kwargs.get("query", ""))}
+            if "offset_x" in kwargs:
+                tool_args["offset_x"] = int(kwargs["offset_x"])
+            if "offset_y" in kwargs:
+                tool_args["offset_y"] = int(kwargs["offset_y"])
         elif action == "VisionLocate":
             tool_name = "phone_vision_locate"
             tool_args = {"query": str(kwargs.get("query", ""))}
@@ -735,47 +749,48 @@ class Main(Star):
             if duration is not None:
                 tool_args = {"timeout_sec": min(float(duration), 15.0)}
         elif action == "Finish":
-            status = kwargs.get("status", "unknown")
-            reason = kwargs.get("reason", "")
-            logger.info(f"Task finished by agent. Status: {status}, Reason: {reason}")
-            return
-        else:
-            logger.warning("phone_mcp intercepted unknown action: %s", action)
-            return
+                status = kwargs.get("status", "unknown")
+                reason = kwargs.get("reason", "")
+                logger.info(f"Task finished by agent. Status: {status}, Reason: {reason}")
+                continue
+            else:
+                logger.warning("phone_mcp intercepted unknown action: %s", action)
+                continue
 
-        logger.info("phone_mcp ACT Parser intercepted: %s -> %s %s", action, tool_name, tool_args)
-        
+            logger.info("phone_mcp ACT Parser intercepted: %s -> %s %s", action, tool_name, tool_args)
+            
+            resp.tools_call_name.append(tool_name)
+            resp.tools_call_args.append(tool_args)
+            resp.tools_call_ids.append(f"call_ast_{uuid4().hex[:8]}")
+
         # Hack: Since ToolLoopAgentRunner has already set its state to DONE by the time on_llm_response
         # is fired (because there were no native JSON tool calls), it will break the run loop after this.
         # We must manually walk the call stack, find the runner, and reset its state so the loop continues.
-        import inspect
-        try:
-            for frame_info in inspect.stack():
-                l_vars = frame_info.frame.f_locals
-                if "self" in l_vars and l_vars["self"].__class__.__name__ == "ToolLoopAgentRunner":
-                    runner = l_vars["self"]
-                    # AgentState is imported in the runner's module, not a class attr.
-                    runner_module = type(runner).__module__
-                    import sys
-                    mod = sys.modules.get(runner_module)
-                    if mod and hasattr(mod, "AgentState"):
-                        runner._state = mod.AgentState.RUNNING
-                        # Also remove the text-only assistant message that step() already appended
-                        # at L507 (before our hook), to prevent duplicate context entries.
-                        # The tool-handling block at L580 will re-add a proper assistant message
-                        # that includes both text and tool_calls.
-                        if runner.run_context.messages and hasattr(runner.run_context.messages[-1], 'role'):
-                            last_msg = runner.run_context.messages[-1]
-                            if getattr(last_msg, 'role', None) == 'assistant':
-                                runner.run_context.messages.pop()
-                        logger.info("phone_mcp reset ToolLoopAgentRunner._state to RUNNING")
-                    break
-        except Exception as e:
-            logger.warning("phone_mcp state reset hack failed: %s", e)
-
-        resp.tools_call_name.append(tool_name)
-        resp.tools_call_args.append(tool_args)
-        resp.tools_call_ids.append(f"call_ast_{uuid4().hex[:8]}")
+        if resp.tools_call_name:
+            import inspect
+            try:
+                for frame_info in inspect.stack():
+                    l_vars = frame_info.frame.f_locals
+                    if "self" in l_vars and l_vars["self"].__class__.__name__ == "ToolLoopAgentRunner":
+                        runner = l_vars["self"]
+                        # AgentState is imported in the runner's module, not a class attr.
+                        runner_module = type(runner).__module__
+                        import sys
+                        mod = sys.modules.get(runner_module)
+                        if mod and hasattr(mod, "AgentState"):
+                            runner._state = mod.AgentState.RUNNING
+                            # Also remove the text-only assistant message that step() already appended
+                            # at L507 (before our hook), to prevent duplicate context entries.
+                            # The tool-handling block at L580 will re-add a proper assistant message
+                            # that includes both text and tool_calls.
+                            if runner.run_context.messages and hasattr(runner.run_context.messages[-1], 'role'):
+                                last_msg = runner.run_context.messages[-1]
+                                if getattr(last_msg, 'role', None) == 'assistant':
+                                    runner.run_context.messages.pop()
+                            logger.info("phone_mcp reset ToolLoopAgentRunner._state to RUNNING")
+                        break
+            except Exception as e:
+                logger.warning("phone_mcp state reset hack failed: %s", e)
 
     @filter.command("phone_status")
     async def phone_status(self, event: AstrMessageEvent):
@@ -891,6 +906,8 @@ class Main(Star):
         self,
         event: AstrMessageEvent,
         query: str,
+        offset_x: int = 0,
+        offset_y: int = 0,
         serial: str = "",
     ) -> str:
         """VL model action: search the local UI tree for an element matching
@@ -903,6 +920,8 @@ class Main(Star):
 
         Args:
             query(string): Target element text, label, or description (e.g. "美团外卖", "搜索", "购物车").
+            offset_x(int): Optional horizontal offset from the center of the found element node, to click nearby objects.
+            offset_y(int): Optional vertical offset from the center of the found element node.
             serial(string): Optional adb serial override.
         """
         matches = []
@@ -948,6 +967,8 @@ class Main(Star):
             )
 
         x, y = tap
+        x += offset_x
+        y += offset_y
         tap_result = await self._run_adb(
             self._adb_base_args(serial) + ["shell", "input", "tap", str(x), str(y)]
         )
@@ -960,6 +981,7 @@ class Main(Star):
                 "matched_id": best.get("id", ""),
                 "match_score": best.get("_match_score", 0),
                 "tap_point": [x, y],
+                "offset": [offset_x, offset_y] if offset_x or offset_y else None,
                 "adb": tap_result,
                 "alternatives": [
                     {

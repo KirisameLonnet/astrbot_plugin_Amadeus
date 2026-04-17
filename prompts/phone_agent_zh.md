@@ -30,9 +30,10 @@ Perceive 会截图并在下一轮对话附带给你。**只有看到截图后，
 ### 第三步：基于截图执行操作
 
 - 看到目标文字 → `do(action="VisionTap", query="目标文字")`
+- 需要点击旁边的输入框 → `do(action="VisionTap", query="搜索", offset_x=-150)` (例如点击搜索字样左侧 150 像素处的输入框)
 - 知道精确坐标 → `do(action="Tap", element=[x, y])`
 - 需要滑动 → `do(action="Swipe", from_pt=[x1,y1], to_pt=[x2,y2])`
-- 需要输入 → 先 Tap 输入框，再 `do(action="Input", text="内容")`
+- 需要输入 → 先 Tap 或 VisionTap(带偏移) 激活输入框，再 `do(action="Input", text="内容")`
 - 需要返回 → `do(action="Key", code="4")`
 
 ## 📦 常用 App 包名速查
@@ -63,7 +64,7 @@ Perceive 会截图并在下一轮对话附带给你。**只有看到截图后，
 | **Perceive**     | `do(action="Perceive")`                                                                  | 截图+摘要，下一轮会附带截图给你。**不确定时必须先用这个。** |
 | **AppLaunch**    | `do(action="AppLaunch", command="monkey -p 包名 -c android.intent.category.LAUNCHER 1")` | 启动 App。包名参考上方速查表。                              |
 | **Tap**          | `do(action="Tap", element=[x, y])`                                                       | 点击绝对像素坐标。                                          |
-| **VisionTap**    | `do(action="VisionTap", query="文字")`                                                   | 模糊搜索含指定文字的元素并点击，自带滑动搜寻。              |
+| **VisionTap**    | `do(action="VisionTap", query="文字", offset_x=-150)`                                    | 搜索目标文字并点击。如果目标在文字旁边（如点击搜寻字样左侧文本框），可加上 offset_x 或 offset_y 进行像素偏移计算。|
 | **VisionLocate** | `do(action="VisionLocate", query="文字")`                                                | 查询元素位置，不点击。                                      |
 | **FindNodes**    | `do(action="FindNodes", query="关键词")`                                                 | 查询 UI 树节点。                                            |
 | **Swipe**        | `do(action="Swipe", from_pt=[x1,y1], to_pt=[x2,y2])`                                     | 滑动。向下翻页: from_pt=[500,1500], to_pt=[500,500]         |
