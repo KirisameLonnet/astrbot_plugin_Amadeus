@@ -4,7 +4,6 @@ import asyncio
 import base64
 import json
 import re
-import shlex
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -22,19 +21,6 @@ from websockets.asyncio.server import ServerConnection, serve
 
 
 PLUGIN_NAME = "astrbot_plugin_phone_mcp"
-SAFE_ADB_SHELL_PATTERN = re.compile(r"^[A-Za-z0-9_./:=,@%+\-\s]+$")
-SAFE_ADB_SHELL_COMMANDS = {
-    "getprop",
-    "wm",
-    "settings",
-    "dumpsys",
-    "pm",
-    "cmd",
-    "am",
-    "input",
-    "logcat",
-    "screencap",
-}
 
 # Characters that must be backslash-escaped for `adb shell input text`.
 _ADB_TEXT_ESCAPE_CHARS = set("$`\"\\()&|;<>#!~{}[]'")
@@ -508,7 +494,8 @@ class Main(Star):
         ]
         return await self._run_adb(args)
 
-    def _parse_safe_shell_command(self, command: str) -> list[str] | None:
+    def _parse_shell_command(self, command: str) -> list[str] | None:
+        """Normalize and wrap a shell command string for adb exec."""
         normalized = command.strip()
         if not normalized:
             return None
@@ -560,7 +547,7 @@ class Main(Star):
         if not text:
             return
 
-        match = re.search(r"<answer>\s*do\((.*?)\)\s*</answer>", text, re.DOTALL | re.IGNORECASE)
+        match = re.search(r"<answer>\s*do\((.*)\)\s*</answer>", text, re.DOTALL | re.IGNORECASE)
         if not match:
             return
 
@@ -651,7 +638,7 @@ class Main(Star):
         if vision_mode or summary_only:
             payload: Any = self._frame_summary(latest)
             if vision_mode:
-                payload["hint"] = "UI tree kept locally. Use phone_vision_tap(query) to tap elements by text, or phone_capture_screenshot to see the screen."
+                payload["hint"] = "UI tree kept locally. Use do(action=\"VisionTap\", query=\"...\") to tap elements by text, or do(action=\"Perceive\") to see the screen."
             return json.dumps(payload, ensure_ascii=False)
         return json.dumps(latest.payload, ensure_ascii=False)
 
@@ -747,6 +734,7 @@ class Main(Star):
             query(string): Target element text, label, or description (e.g. "美团外卖", "搜索", "购物车").
             serial(string): Optional adb serial override.
         """
+        matches = []
         max_scrolls = 3
         for i in range(max_scrolls):
             matches = self._search_nodes_scored(query, limit=5)
@@ -755,11 +743,13 @@ class Main(Star):
             
             if i < max_scrolls - 1:
                 # Auto-swipe: swipe from bottom to top (scroll down)
+                latest = self._latest_frame()
+                after_ms = latest.received_at_ms if latest else 0
                 await self._run_adb(
                     self._adb_base_args(serial) + ["shell", "input", "swipe", "500", "1500", "500", "500"]
                 )
-                # Wait for animation and new UI frame from websocket
-                await asyncio.sleep(2.0)
+                # Wait for new UI frame from websocket instead of blind sleep
+                await self.frame_store.wait_next_frame(after_ms, timeout=4.0)
 
         if not matches:
             return json.dumps(
@@ -815,7 +805,7 @@ class Main(Star):
 
     @llm_tool(name="phone_vision_locate")
     async def phone_vision_locate(
-        self, event: AstrMessageEvent, query: str, limit: int = 5
+        self, event: AstrMessageEvent, query: str, limit: int = 5, serial: str = ""
     ) -> str:
         """Search the local UI tree for elements matching the query and return
         their coordinates without tapping. Use this to verify element positions
@@ -824,7 +814,9 @@ class Main(Star):
         Args:
             query(string): Target element text, label, or description.
             limit(number): Max number of candidates to return.
+            serial(string): Optional adb serial override.
         """
+        matches = []
         max_scrolls = 3
         for i in range(max_scrolls):
             matches = self._search_nodes_scored(query, limit=max(1, min(limit, 10)))
@@ -833,10 +825,12 @@ class Main(Star):
                 
             if i < max_scrolls - 1:
                 # Auto-swipe: swipe from bottom to top (scroll down)
+                latest = self._latest_frame()
+                after_ms = latest.received_at_ms if latest else 0
                 await self._run_adb(
-                    self._adb_base_args("") + ["shell", "input", "swipe", "500", "1500", "500", "500"]
+                    self._adb_base_args(serial) + ["shell", "input", "swipe", "500", "1500", "500", "500"]
                 )
-                await asyncio.sleep(2.0)
+                await self.frame_store.wait_next_frame(after_ms, timeout=4.0)
 
         if not matches:
             return json.dumps({
@@ -877,7 +871,7 @@ class Main(Star):
         primary "eyes" for vision-assisted apps instead of reading the full UI tree.
 
         After calling this, look at the attached screenshot to understand the screen,
-        then use phone_vision_tap(query) to act on what you see.
+        then use do(action="VisionTap", query="...") to act on what you see.
 
         Args:
             serial(string): Optional adb serial override.
@@ -910,7 +904,7 @@ class Main(Star):
             {
                 "screenshot": screenshot_result,
                 "frame_summary": summary,
-                "hint": "Screenshot attached. Look at the image to understand the screen. Use phone_vision_tap(query) to tap elements by their visible text or description.",
+                "hint": "Screenshot attached. Look at the image to understand the screen. Use do(action=\"VisionTap\", query=\"...\") to tap elements by their visible text or description.",
             },
             ensure_ascii=False,
         )
@@ -1043,7 +1037,7 @@ class Main(Star):
         """
         if not self._cfg_bool("allow_adb_shell", False):
             return json.dumps({"error": "adb_shell_disabled"}, ensure_ascii=False)
-        safe_parts = self._parse_safe_shell_command(command)
+        safe_parts = self._parse_shell_command(command)
         if safe_parts is None:
             return json.dumps({"error": "empty_adb_shell_command"}, ensure_ascii=False)
         result = await self._run_adb(

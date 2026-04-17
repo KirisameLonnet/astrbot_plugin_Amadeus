@@ -33,10 +33,5 @@
     "type": "bool",
     "description": "Allow arbitrary adb shell commands from tools",
     "default": true
-  },
-  "vl_model_available": {
-    "type": "bool",
-    "description": "Enable VL model mode for vision-assisted apps. When true, UI tree is used only as local coordinate dictionary; LLM uses screenshots for visual understanding instead of receiving the full element tree.",
-    "default": true
   }
 }

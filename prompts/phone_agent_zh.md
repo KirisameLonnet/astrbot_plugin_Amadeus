@@ -66,7 +66,7 @@ do(action="VisionTap", query="搜索")
 </answer>
 ```
 
-### 例证 4：遇到牛皮癣小弹窗
+### 例证 3：遇到牛皮癣小弹窗
 **Agent**:
 ```xml
 <think>
