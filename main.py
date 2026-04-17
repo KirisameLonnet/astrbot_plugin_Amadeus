@@ -27,6 +27,48 @@ _ADB_TEXT_ESCAPE_CHARS = set("$`\"\\()&|;<>#!~{}[]'")
 
 _MAX_SCREENSHOTS = 50
 
+# Chinese / common app name → Android package name mapping.
+# Used by the Launch/AppLaunch action handler so the model can say
+# do(action="Launch", app="美团") without knowing the package name.
+_COMMON_APP_PACKAGES: dict[str, str] = {
+    "美团": "com.sankuai.meituan",
+    "美团外卖": "com.sankuai.meituan.takeoutnew",
+    "微信": "com.tencent.mm",
+    "支付宝": "com.eg.android.AlipayGphone",
+    "淘宝": "com.taobao.taobao",
+    "抖音": "com.ss.android.ugc.aweme",
+    "设置": "com.android.settings",
+    "系统设置": "com.android.settings",
+    "拼多多": "com.xunmeng.pinduoduo",
+    "京东": "com.jingdong.app.mall",
+    "QQ": "com.tencent.mobileqq",
+    "qq": "com.tencent.mobileqq",
+    "高德地图": "com.autonavi.minimap",
+    "高德": "com.autonavi.minimap",
+    "百度地图": "com.baidu.BaiduMap",
+    "小红书": "com.xingin.xhs",
+    "哔哩哔哩": "tv.danmaku.bili",
+    "B站": "tv.danmaku.bili",
+    "b站": "tv.danmaku.bili",
+    "bilibili": "tv.danmaku.bili",
+    "网易云音乐": "com.netease.cloudmusic",
+    "网易云": "com.netease.cloudmusic",
+    "饿了么": "me.ele",
+    "闲鱼": "com.taobao.idlefish",
+    "钉钉": "com.alibaba.android.rimet",
+    "飞书": "com.ss.android.lark",
+    "知乎": "com.zhihu.android",
+    "豆瓣": "com.douban.frodo",
+    "大众点评": "com.dianping.v1",
+    "携程": "ctrip.android.view",
+    "滴滴": "com.sdu.didi.psnger",
+    "WPS": "cn.wps.moffice_eng",
+    "相机": "com.android.camera",
+    "Chrome": "com.android.chrome",
+    "chrome": "com.android.chrome",
+    "浏览器": "com.android.browser",
+}
+
 
 @dataclass
 class StoredFrame:
@@ -550,6 +592,9 @@ class Main(Star):
         # Make <answer> optional and use non-greedy match for do(...)
         match = re.search(r"do\((.*?)\)", text, re.DOTALL | re.IGNORECASE)
         if not match:
+            # Debug: log when model output contains no do() command at all
+            preview = text[:200].replace('\n', ' ')
+            logger.warning("phone_mcp no do() command found in model output: %s...", preview)
             return
 
         cmd_str = match.group(1).strip()
@@ -591,18 +636,36 @@ class Main(Star):
             tool_args = {"query": str(kwargs.get("query", ""))}
         elif action == "Perceive":
             tool_name = "phone_vision_describe"
-        elif action in ["AppLaunch", "Launch"]:
+        elif action in ["AppLaunch", "Launch", "Open", "OpenApp"]:
             tool_name = "adb_shell"
             if "command" in kwargs:
                 tool_args = {"command": str(kwargs.get("command", ""))}
             else:
-                app_name = str(kwargs.get("app", ""))
-                if "设置" in app_name:
+                app_name = str(kwargs.get("app", kwargs.get("name", "")))
+                package = _COMMON_APP_PACKAGES.get(app_name, "")
+                if not package:
+                    # Fuzzy: try substring match
+                    for cn_name, pkg in _COMMON_APP_PACKAGES.items():
+                        if cn_name in app_name or app_name in cn_name:
+                            package = pkg
+                            break
+                if not package:
+                    # If it looks like a package name already (has dots), use directly
+                    if "." in app_name:
+                        package = app_name
+                    else:
+                        logger.warning("phone_mcp unknown app name '%s', trying as package", app_name)
+                        package = app_name
+                if package == "com.android.settings":
                     tool_args = {"command": "am start -a android.settings.SETTINGS"}
                 else:
-                    tool_args = {"command": f"monkey -p {app_name} -c android.intent.category.LAUNCHER 1"}
+                    tool_args = {"command": f"monkey -p {package} -c android.intent.category.LAUNCHER 1"}
+                logger.info("phone_mcp Launch resolved: '%s' -> package='%s'", app_name, package)
         elif action == "Wait":
             tool_name = "phone_wait_next_frame"
+            duration = kwargs.get("duration", None)
+            if duration is not None:
+                tool_args = {"timeout_sec": min(float(duration), 15.0)}
         elif action == "Finish":
             status = kwargs.get("status", "unknown")
             reason = kwargs.get("reason", "")
