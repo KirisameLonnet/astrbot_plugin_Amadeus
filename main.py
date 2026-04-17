@@ -542,16 +542,20 @@ class Main(Star):
 
     @filter.on_llm_response()
     async def intercept_action_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        """Intercept <answer>do(...)</answer> and inject into AstBot's ToolRunner."""
+        """Intercept do(...) and inject into AstBot's ToolRunner."""
         text = resp.completion_text
         if not text:
             return
 
-        match = re.search(r"<answer>\s*do\((.*)\)\s*</answer>", text, re.DOTALL | re.IGNORECASE)
+        # Make <answer> optional and use non-greedy match for do(...)
+        match = re.search(r"do\((.*?)\)", text, re.DOTALL | re.IGNORECASE)
         if not match:
             return
 
         cmd_str = match.group(1).strip()
+        # Replace full-width quotes that models often hallucinate
+        cmd_str = cmd_str.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
+        
         kwargs = self._parse_do_command(cmd_str)
         action = kwargs.pop("action", None)
         if not action:
@@ -587,9 +591,16 @@ class Main(Star):
             tool_args = {"query": str(kwargs.get("query", ""))}
         elif action == "Perceive":
             tool_name = "phone_vision_describe"
-        elif action == "AppLaunch":
+        elif action in ["AppLaunch", "Launch"]:
             tool_name = "adb_shell"
-            tool_args = {"command": str(kwargs.get("command", ""))}
+            if "command" in kwargs:
+                tool_args = {"command": str(kwargs.get("command", ""))}
+            else:
+                app_name = str(kwargs.get("app", ""))
+                if "设置" in app_name:
+                    tool_args = {"command": "am start -a android.settings.SETTINGS"}
+                else:
+                    tool_args = {"command": f"monkey -p {app_name} -c android.intent.category.LAUNCHER 1"}
         elif action == "Wait":
             tool_name = "phone_wait_next_frame"
         elif action == "Finish":
