@@ -544,13 +544,38 @@ class Main(Star):
         # Pass the entire shell command as a single argument so adb handles pipes `|`, `>`, etc. correctly.
         return [normalized]
 
+    # Model names (case-insensitive substrings) that need auto-screenshot injection
+    # because they tend to hallucinate screen content without visual grounding.
+    _VISION_WEAK_MODEL_KEYWORDS = {"autoglm"}
+
+    def _is_vision_weak_model(self, request: ProviderRequest) -> bool:
+        """Check if the current model is known to hallucinate without visual input."""
+        model_name = (request.model or "").lower()
+        return any(kw in model_name for kw in self._VISION_WEAK_MODEL_KEYWORDS)
+
     @filter.on_llm_request()
     async def inject_phone_agent_prompt(self, event: AstrMessageEvent, request: ProviderRequest):
         """Inject customized phone automation strategies into to the LLM's system prompt."""
         if self._system_prompt:
             request.system_prompt += f"\n\n{self._system_prompt}\n"
-            
-        # If the agent just called the capture screenshot tool, attach the image to this prompt
+
+        # Always inject lightweight frame metadata so the model has ground truth
+        # about what app is currently in foreground (prevents hallucination).
+        latest = self._latest_frame()
+        if latest is not None:
+            summary = self._frame_summary(latest)
+            frame_info = (
+                f"\n[PHONE STATE]\n"
+                f"当前前台应用: {summary.get('package_name', 'unknown')}\n"
+                f"Activity: {summary.get('activity_name', 'unknown')}\n"
+                f"UI元素数量: {summary.get('element_count', 0)}\n"
+                f"可点击元素: {summary.get('actionable_count', 0)}\n"
+                f"含文本元素: {summary.get('text_count', 0)}\n"
+            )
+            request.system_prompt += frame_info
+
+        # Check if there's already a screenshot attached from a previous tool call
+        has_screenshot = False
         if request.contexts:
             # Look backwards in contexts to find the most recent screenshot
             for ctx in reversed(request.contexts):
@@ -561,9 +586,27 @@ class Main(Star):
                             # Attach the image to the current provider request
                             request.image_urls.append(f"file:///{data['file_path']}")
                             request.system_prompt += "\n\n[SYSTEM NOTIFICATION]\nThe requested screenshot image is attached to this turn. Please look at it to perceive the UI and continue your task.\n"
+                            has_screenshot = True
                             break # Only attach the most recent screenshot
                     except Exception:
                         pass
+
+        # Auto-capture screenshot for vision-weak models (e.g. AutoGLM) that
+        # tend to hallucinate screen content when no visual input is provided.
+        # Other models (GPT-4, Claude, etc.) use the standard Perceive workflow.
+        if not has_screenshot and self._is_vision_weak_model(request):
+            try:
+                result = await self._capture_screencap(None)
+                if result.get("file_path"):
+                    request.image_urls.append(f"file:///{result['file_path']}")
+                    request.system_prompt += (
+                        "\n\n[SYSTEM NOTIFICATION]\n"
+                        "当前手机屏幕截图已自动附上。请仔细观察截图内容，"
+                        "基于你真实看到的画面决定下一步操作。不要想象或猜测屏幕内容。\n"
+                    )
+                    logger.info("phone_mcp auto-screenshot injected for vision-weak model: %s", request.model)
+            except Exception as e:
+                logger.warning("phone_mcp auto-screenshot failed: %s", e)
 
     def _parse_do_command(self, cmd_str: str) -> dict[str, Any]:
         """Safely parse do(action="...", ...) string into a kwargs dictionary."""
