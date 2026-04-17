@@ -492,12 +492,32 @@ class Main(Star):
             if proc.returncode != 0 or not stdout:
                 return result
 
+            # Compress high-res screenshots to prevent local LLM visual token OOM / 502 Timeout
+            try:
+                from PIL import Image
+                import io
+                image = Image.open(io.BytesIO(stdout))
+                max_size = 512
+                if max(image.width, image.height) > max_size:
+                    # Resize keeping aspect ratio
+                    ratio = max_size / max(image.width, image.height)
+                    new_size = (int(image.width * ratio), int(image.height * ratio))
+                    image = image.resize(new_size, Image.Resampling.LANCZOS)
+                    out_buffer = io.BytesIO()
+                    image.save(out_buffer, format="PNG")
+                    stdout = out_buffer.getvalue()
+                    result["size_bytes"] = len(stdout)
+                    logger.info(f"Screencap compressed to {new_size[0]}x{new_size[1]} ({result['size_bytes']} bytes)")
+            except Exception as e:
+                logger.warning(f"Failed to compress screenshot, using original: {e}")
+
             if self._cfg_bool("persist_screenshots", True):
                 file_name = f"{int(time.time() * 1000)}_{uuid4().hex[:8]}.png"
                 file_path = self.screenshot_dir / file_name
                 await asyncio.to_thread(file_path.write_bytes, stdout)
                 result["file_path"] = str(file_path)
                 # Rotate old screenshots to prevent unbounded disk usage
+
                 await self._rotate_screenshots()
             return result
         except Exception as exc:
