@@ -33,5 +33,10 @@
     "type": "bool",
     "description": "Allow arbitrary adb shell commands from tools",
     "default": true
+  },
+  "model_supports_vision": {
+    "type": "bool",
+    "description": "Whether the current LLM supports image input. Set to false for text-only models (e.g. AutoGLM without mmproj) to avoid 500 errors from image injection.",
+    "default": false
   }
 }

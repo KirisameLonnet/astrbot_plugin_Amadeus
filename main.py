@@ -574,9 +574,14 @@ class Main(Star):
             )
             request.system_prompt += frame_info
 
+        # All image injection below is gated on model_supports_vision.
+        # Text-only models (e.g. AutoGLM on llama.cpp without mmproj) will
+        # crash with 500 if we send image_urls, so we must skip entirely.
+        vision_enabled = self._cfg_bool("model_supports_vision", False)
+
         # Check if there's already a screenshot attached from a previous tool call
         has_screenshot = False
-        if request.contexts:
+        if vision_enabled and request.contexts:
             # Look backwards in contexts to find the most recent screenshot
             for ctx in reversed(request.contexts):
                 if ctx.get("role") == "tool" and "file_path" in str(ctx.get("content", "")):
@@ -593,8 +598,8 @@ class Main(Star):
 
         # Auto-capture screenshot for vision-weak models (e.g. AutoGLM) that
         # tend to hallucinate screen content when no visual input is provided.
-        # Other models (GPT-4, Claude, etc.) use the standard Perceive workflow.
-        if not has_screenshot and self._is_vision_weak_model(request):
+        # Only works when model_supports_vision is true.
+        if vision_enabled and not has_screenshot and self._is_vision_weak_model(request):
             try:
                 result = await self._capture_screencap(None)
                 if result.get("file_path"):
