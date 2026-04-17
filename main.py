@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import ast
 from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import ProviderRequest, LLMResponse
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from websockets.asyncio.server import ServerConnection, serve
@@ -534,6 +535,86 @@ class Main(Star):
                             break # Only attach the most recent screenshot
                     except Exception:
                         pass
+
+    def _parse_do_command(self, cmd_str: str) -> dict[str, Any]:
+        """Safely parse do(action="...", ...) string into a kwargs dictionary."""
+        try:
+            dummy_code = f"dummy({cmd_str})"
+            tree = ast.parse(dummy_code)
+            call_node = tree.body[0].value
+            kwargs = {}
+            for kw in call_node.keywords:
+                if isinstance(kw.value, ast.Constant):
+                    kwargs[kw.arg] = kw.value.value
+                elif getattr(ast, "List", None) and getattr(kw.value, "elts", None):
+                    kwargs[kw.arg] = [elt.value for elt in kw.value.elts if isinstance(elt, ast.Constant)]
+            return kwargs
+        except Exception as e:
+            logger.warning("phone_mcp ast parser error for '%s': %s", cmd_str, e)
+            return {}
+
+    @filter.on_llm_response()
+    async def intercept_action_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        """Intercept <answer>do(...)</answer> and inject into AstBot's ToolRunner."""
+        text = resp.completion_text
+        if not text:
+            return
+
+        match = re.search(r"<answer>\s*do\((.*?)\)\s*</answer>", text, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return
+
+        cmd_str = match.group(1).strip()
+        kwargs = self._parse_do_command(cmd_str)
+        action = kwargs.pop("action", None)
+        if not action:
+            logger.warning("phone_mcp intercepted action missing 'action' inside do().")
+            return
+            
+        tool_name = ""
+        tool_args = {}
+
+        if action == "Tap":
+            tool_name = "adb_tap"
+            pt = kwargs.get("element", [0, 0])
+            tool_args = {"x": pt[0], "y": pt[1]}
+        elif action == "Swipe":
+            tool_name = "adb_swipe"
+            from_pt = kwargs.get("from_pt", [0, 0])
+            to_pt = kwargs.get("to_pt", [0, 0])
+            tool_args = {"x1": from_pt[0], "y1": from_pt[1], "x2": to_pt[0], "y2": to_pt[1]}
+        elif action == "Input":
+            tool_name = "adb_input_text"
+            tool_args = {"text": str(kwargs.get("text", ""))}
+        elif action == "Key":
+            tool_name = "adb_keyevent"
+            tool_args = {"keycode": str(kwargs.get("code", ""))}
+        elif action == "VisionTap":
+            tool_name = "phone_vision_tap"
+            tool_args = {"query": str(kwargs.get("query", ""))}
+        elif action == "VisionLocate":
+            tool_name = "phone_vision_locate"
+            tool_args = {"query": str(kwargs.get("query", ""))}
+        elif action == "FindNodes":
+            tool_name = "phone_find_nodes"
+            tool_args = {"query": str(kwargs.get("query", ""))}
+        elif action == "Perceive":
+            tool_name = "phone_vision_describe"
+        elif action == "AppLaunch":
+            tool_name = "adb_shell"
+            tool_args = {"command": str(kwargs.get("command", ""))}
+        elif action == "Wait":
+            tool_name = "phone_wait_next_frame"
+        elif action == "Finish":
+            return 
+        else:
+            logger.warning("phone_mcp intercepted unknown action: %s", action)
+            return
+
+        logger.info("phone_mcp ACT Parser intercepted: %s -> %s %s", action, tool_name, tool_args)
+        resp.tools_call_name.append(tool_name)
+        resp.tools_call_args.append(tool_args)
+        resp.tools_call_ids.append(f"call_ast_{uuid4().hex[:8]}")
 
     @filter.command("phone_status")
     async def phone_status(self, event: AstrMessageEvent):
